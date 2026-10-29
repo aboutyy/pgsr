@@ -17,6 +17,10 @@ def skew(w):
 
 def se3_exp(xi):
     """xi = (rho[3], omega[3]) -> 4x4 SE(3). Taylor-safe near zero."""
+    return se3_exp_batch(xi[None])[0]
+
+
+def _se3_exp_old(xi):
     rho, omega = xi[:3], xi[3:]
     th2 = (omega * omega).sum()
     th = torch.sqrt(th2 + 1e-12)
@@ -78,8 +82,27 @@ def pose_errors(cams):
                 center_mean=te.mean(), center_median=float(np.median(te)), center_max=te.max(), n=len(re))
 
 
+def se3_exp_batch(xi):
+    """xi [N,6] = (rho, omega) -> [N,4,4]. Branch-free (no host sync)."""
+    rho, omega = xi[:, :3], xi[:, 3:]
+    th2 = (omega * omega).sum(-1)
+    small = th2 < 1e-10
+    th2s = torch.where(small, torch.ones_like(th2), th2)
+    ths = torch.sqrt(th2s)
+    A = torch.where(small, 1.0 - th2 / 6.0, torch.sin(ths) / ths)
+    B = torch.where(small, 0.5 - th2 / 24.0, (1 - torch.cos(ths)) / th2s)
+    C = torch.where(small, 1.0 / 6.0 - th2 / 120.0, (ths - torch.sin(ths)) / (th2s * ths))
+    K = skew(omega); KK = K @ K
+    I = torch.eye(3, device=xi.device, dtype=xi.dtype).expand_as(K)
+    R = I + A[:, None, None] * K + B[:, None, None] * KK
+    V = I + B[:, None, None] * K + C[:, None, None] * KK
+    T = torch.zeros(xi.shape[0], 4, 4, device=xi.device, dtype=xi.dtype)
+    T[:, :3, :3] = R; T[:, :3, 3] = (V @ rho[:, :, None])[:, :, 0]; T[:, 3, 3] = 1.0
+    return T
+
+
 class GCPTerm:
-    """GCP reprojection term.
+    """GCP reprojection term (vectorised over all observations).
     CSV columns: point_id,X,Y,Z,sigma_xyz,image_name,u,v,sigma_px,image_width
       X,Y,Z / sigma_xyz in the scene world frame & units (same frame as the camera poses);
       u,v / sigma_px in pixels of an image `image_width` px wide (rescaled to the training resolution).
@@ -87,44 +110,69 @@ class GCPTerm:
     """
     def __init__(self, path, cams, huber_delta=3.0):
         by_name = {c.image_name: c for c in cams}
-        self.obs, skipped = [], 0
+        rows, skipped = [], 0
         with open(path) as f:
             for r in csv.DictReader(f):
                 name = r["image_name"].rsplit(".", 1)[0]
                 cam = by_name.get(name) or by_name.get(r["image_name"])
                 if cam is None:
                     skipped += 1; continue
-                s = cam.image_width / float(r["image_width"])
-                self.obs.append((cam, [float(r["X"]), float(r["Y"]), float(r["Z"])], float(r["sigma_xyz"]),
-                                 [float(r["u"]) * s, float(r["v"]) * s], float(r["sigma_px"]) * s, r["point_id"]))
-        self.points = sorted({o[5] for o in self.obs})
+                rows.append((cam, r))
+        self.cams = list({id(c): c for c, _ in rows}.values())
+        cidx = {id(c): i for i, c in enumerate(self.cams)}
+        dev = "cuda"
+        def t(v): return torch.tensor(v, device=dev, dtype=torch.float32)
+        sc = [c.image_width / float(r["image_width"]) for c, r in rows]
+        self.ci = torch.tensor([cidx[id(c)] for c, _ in rows], device=dev, dtype=torch.long)
+        self.X = t([[float(r["X"]), float(r["Y"]), float(r["Z"])] for _, r in rows])
+        self.sx = t([float(r["sigma_xyz"]) for _, r in rows])
+        self.uv = t([[float(r["u"]) * s, float(r["v"]) * s] for (_, r), s in zip(rows, sc)])
+        self.spx = t([float(r["sigma_px"]) * s for (_, r), s in zip(rows, sc)])
+        self.F = t([[c.Fx, c.Fy] for c in self.cams]); self.Cc = t([[c.Cx, c.Cy] for c in self.cams])
+        self.obs = rows  # kept for len()/compat
+        self.points = sorted({r["point_id"] for _, r in rows})
         self.delta = huber_delta
-        print(f"[GCP] {len(self.obs)} observations of {len(self.points)} points loaded, {skipped} skipped (image not in train set)")
+        print(f"[GCP] {len(rows)} observations of {len(self.points)} points in {len(self.cams)} images loaded, {skipped} skipped (image not in train set)")
+
+    def cam_w2c(self):
+        base = torch.stack([c.base_w2c for c in self.cams])
+        if all(c.pose_delta is None for c in self.cams):
+            return base
+        d = torch.stack([c.pose_delta if c.pose_delta is not None else torch.zeros(6, device="cuda") for c in self.cams])
+        return se3_exp_batch(d) @ base
+
+    def _proj(self):
+        W = self.cam_w2c()[self.ci]
+        Xc = (W[:, :3, :3] @ self.X[:, :, None])[:, :, 0] + W[:, :3, 3]
+        z = Xc[:, 2:3].clamp(min=1e-6)
+        F, C = self.F[self.ci], self.Cc[self.ci]
+        return F * Xc[:, :2] / z + C, z[:, 0]
 
     def residuals(self):
-        out = []
-        for cam, X, sx, uv, spx, _ in self.obs:
-            W = cam.effective_w2c()
-            Xc = W[:3, :3] @ torch.tensor(X, device="cuda") + W[:3, 3]
-            z = Xc[2].clamp(min=1e-6)
-            proj = torch.stack([cam.Fx * Xc[0] / z + cam.Cx, cam.Fy * Xc[1] / z + cam.Cy])
-            sig = torch.sqrt(spx ** 2 + (cam.Fx * sx / z) ** 2)
-            out.append((proj - torch.tensor(uv, device="cuda")) / sig)
-        return torch.stack(out)
+        proj, z = self._proj()
+        sig = torch.sqrt(self.spx ** 2 + (self.F[self.ci, 0] * self.sx / z) ** 2)
+        return (proj - self.uv) / sig[:, None]
 
     def loss(self):
         r = self.residuals()
         return F.huber_loss(r, torch.zeros_like(r), delta=self.delta)
 
+    def refresh(self):
+        """Batched equivalent of cam.refresh_pose(sync_numpy=False) for all GCP cameras."""
+        with torch.no_grad():
+            W = self.cam_w2c().detach()
+            WT = W.transpose(1, 2).contiguous()
+            P = torch.stack([c.projection_matrix for c in self.cams])
+            FP = torch.bmm(WT, P)
+            Cn = torch.inverse(WT)[:, 3, :3]
+            for i, c in enumerate(self.cams):
+                c.world_view_transform = WT[i]; c.full_proj_transform = FP[i]; c.camera_center = Cn[i]
+                c._RT_stale = True
+
     def rms_px(self):
         with torch.no_grad():
-            r = []
-            for cam, X, sx, uv, spx, _ in self.obs:
-                W = cam.effective_w2c()
-                Xc = W[:3, :3] @ torch.tensor(X, device="cuda") + W[:3, 3]
-                p = torch.stack([cam.Fx * Xc[0] / Xc[2] + cam.Cx, cam.Fy * Xc[1] / Xc[2] + cam.Cy])
-                r.append(float((p - torch.tensor(uv, device="cuda")).norm()))
-            return float(np.sqrt(np.mean(np.square(r))))
+            proj, _ = self._proj()
+            return float(((proj - self.uv) ** 2).sum(-1).mean().sqrt())
 
 
 def quaternion_to_matrix(q):

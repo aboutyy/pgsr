@@ -366,8 +366,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         p.copy_(s0 + (p - s0) * m5_lr_vec)
             pose_optimizer.zero_grad(set_to_none=True)
             viewpoint_cam.refresh_pose()
-            if gcp_term is not None:
-                for c in {o[0] for o in gcp_term.obs}: c.refresh_pose()
+            if gcp_term is not None and iteration >= m5.pose_opt_from:
+                gcp_term.refresh()
             if iteration % 1000 == 0:
                 e = pose_errors(train_cams)
                 extra = f" gcp_rms_px={gcp_term.rms_px():.3f}" if gcp_term is not None else ""

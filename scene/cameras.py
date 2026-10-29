@@ -122,15 +122,37 @@ class Camera(nn.Module):
         from utils.pose_utils import se3_exp
         return se3_exp(self.pose_delta) @ self.base_w2c
 
-    def refresh_pose(self):
-        """Write the current (detached) effective pose into the matrices used by the rasterizer and PGSR losses."""
+    def refresh_pose(self, sync_numpy=True):
+        """Write the current (detached) effective pose into the matrices used by the rasterizer and PGSR losses.
+        sync_numpy=False skips the GPU->CPU copy of R/T; they are then recomputed lazily on next access."""
         with torch.no_grad():
             W = self.effective_w2c().detach()
             self.world_view_transform = W.T.contiguous()
             self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
             self.camera_center = self.world_view_transform.inverse()[3, :3]
-            self.R = W[:3, :3].T.cpu().numpy().astype(np.float64)
-            self.T = W[:3, 3].cpu().numpy().astype(np.float64)
+            if sync_numpy:
+                self.R = W[:3, :3].T.cpu().numpy().astype(np.float64)
+                self.T = W[:3, 3].cpu().numpy().astype(np.float64)
+            else:
+                self._RT_stale = True
+
+    @property
+    def R(self):
+        if self.__dict__.get("_RT_stale"): self._sync_RT()
+        return self.__dict__["_R"]
+    @R.setter
+    def R(self, v): self.__dict__["_R"] = v
+    @property
+    def T(self):
+        if self.__dict__.get("_RT_stale"): self._sync_RT()
+        return self.__dict__["_T"]
+    @T.setter
+    def T(self, v): self.__dict__["_T"] = v
+    def _sync_RT(self):
+        W = self.world_view_transform.T
+        self.__dict__["_R"] = W[:3, :3].T.cpu().numpy().astype(np.float64)
+        self.__dict__["_T"] = W[:3, 3].cpu().numpy().astype(np.float64)
+        self.__dict__["_RT_stale"] = False
 
     def pose_correction(self):
         """T = W_eff.detach()^-1 @ W_eff: identity in value, carries d/d(pose_delta).
