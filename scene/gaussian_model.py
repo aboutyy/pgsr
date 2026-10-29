@@ -20,7 +20,10 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from pytorch3d.transforms import quaternion_to_matrix
+try:
+    from pytorch3d.transforms import quaternion_to_matrix
+except ImportError:  # M5: avoid the pytorch3d build; same (w,x,y,z) convention as pytorch3d
+    from utils.pose_utils import quaternion_to_matrix
 
 def dilate(bin_img, ksize=5):
     pad = (ksize - 1) // 2
