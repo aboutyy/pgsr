@@ -97,6 +97,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
 
+    # ---- M5: pose perturbation / refinement / GCP term ----
+    from utils.pose_utils import perturb_cameras, pose_errors, GCPTerm
+    import json
+    m5 = m5_args
+    train_cams = scene.getTrainCameras()
+    m5_log = {"args": vars(m5)}
+    if m5.pose_noise_rot_deg > 0 or m5.pose_noise_trans > 0:
+        perturb_cameras(train_cams, m5.pose_noise_rot_deg, m5.pose_noise_trans, m5.pose_noise_seed)
+    pose_optimizer = None
+    if m5.optimize_pose:
+        pose_params = [cam.enable_pose_opt() for cam in train_cams]
+        # Adam with lr=1, then each step is rescaled per component: (rho: pose_lr_trans, omega: pose_lr_rot)
+        pose_optimizer = torch.optim.Adam(pose_params, lr=1.0, eps=1e-15)
+        m5_lr_vec = torch.tensor([m5.pose_lr_trans] * 3 + [m5.pose_lr_rot] * 3, device="cuda")
+    gcp_term = GCPTerm(m5.gcp_file, train_cams) if m5.gcp_file else None
+    if gcp_term is not None and not m5.optimize_pose:
+        print("[GCP] warning: --gcp_file without --optimize_pose has no effect on poses")
+    e0 = pose_errors(train_cams); m5_log["pose_err_start"] = e0
+    if gcp_term is not None: m5_log["gcp_rms_px_start"] = gcp_term.rms_px()
+    print("[M5] pose error at start:", e0)
+
     app_model = AppModel()
     app_model.train()
     app_model.cuda()
@@ -329,8 +350,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             ncc_loss = ncc_weight * ncc.mean()
                             loss += ncc_loss
 
+        if gcp_term is not None and m5.optimize_pose and iteration >= m5.pose_opt_from:
+            gcp_loss = m5.lambda_gcp * gcp_term.loss()
+            loss = loss + gcp_loss
         loss.backward()
         iter_end.record()
+        if pose_optimizer is not None:
+            if iteration >= m5.pose_opt_from:
+                # per-component lr: Adam with lr=1 on pre-scaled steps is not equivalent, so scale param update manually
+                with torch.no_grad():
+                    saved = [p.detach().clone() for p in pose_params]
+                pose_optimizer.step()
+                with torch.no_grad():
+                    for p, s0 in zip(pose_params, saved):
+                        p.copy_(s0 + (p - s0) * m5_lr_vec)
+            pose_optimizer.zero_grad(set_to_none=True)
+            viewpoint_cam.refresh_pose()
+            if gcp_term is not None:
+                for c in {o[0] for o in gcp_term.obs}: c.refresh_pose()
+            if iteration % 1000 == 0:
+                e = pose_errors(train_cams)
+                extra = f" gcp_rms_px={gcp_term.rms_px():.3f}" if gcp_term is not None else ""
+                print(f"\n[M5 ITER {iteration}] rot_mean={e['rot_mean_deg']:.4f}deg center_mean={e['center_mean']:.5f}{extra}")
 
         with torch.no_grad():
             # Progress bar
@@ -393,6 +434,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 app_model.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 app_model.optimizer.zero_grad(set_to_none = True)
+
+            if iteration == opt.iterations:
+                for c in train_cams: c.refresh_pose()
+                m5_log["pose_err_end"] = pose_errors(train_cams)
+                if gcp_term is not None: m5_log["gcp_rms_px_end"] = gcp_term.rms_px()
+                m5_log["poses_w2c"] = {c.image_name: c.effective_w2c().detach().cpu().tolist() for c in train_cams}
+                with open(os.path.join(scene.model_path, "m5_pose_log.json"), "w") as f:
+                    json.dump(m5_log, f, indent=1, default=float)
+                print("[M5] pose error at end:", m5_log["pose_err_end"])
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -483,6 +533,16 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    # M5 options
+    parser.add_argument("--optimize_pose", action="store_true", help="group (c): per-camera se(3) refinement")
+    parser.add_argument("--pose_lr_rot", type=float, default=1e-4)
+    parser.add_argument("--pose_lr_trans", type=float, default=1e-4)
+    parser.add_argument("--pose_opt_from", type=int, default=500)
+    parser.add_argument("--gcp_file", type=str, default="", help="group (d): GCP reprojection term (needs --optimize_pose)")
+    parser.add_argument("--lambda_gcp", type=float, default=0.1)
+    parser.add_argument("--pose_noise_rot_deg", type=float, default=0.0, help="smoke test: perturb train poses")
+    parser.add_argument("--pose_noise_trans", type=float, default=0.0)
+    parser.add_argument("--pose_noise_seed", type=int, default=0)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -494,6 +554,8 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    import argparse as _ap
+    m5_args = _ap.Namespace(**{k: getattr(args, k) for k in ["optimize_pose","pose_lr_rot","pose_lr_trans","pose_opt_from","gcp_file","lambda_gcp","pose_noise_rot_deg","pose_noise_trans","pose_noise_seed"]})
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done

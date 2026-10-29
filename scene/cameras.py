@@ -102,6 +102,44 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         self.plane_mask, self.non_plane_mask = None, None
+        # M5 pose refinement state (inactive unless enable_pose_opt() is called)
+        self.base_w2c = self.world_view_transform.T.contiguous()
+        self.gt_w2c = self.base_w2c.clone()
+        self.pose_delta = None
+
+    # ---- M5: se(3) pose refinement ------------------------------------------------
+    def set_base_w2c(self, w2c):
+        self.base_w2c = w2c.detach().contiguous()
+        self.refresh_pose()
+
+    def enable_pose_opt(self):
+        self.pose_delta = torch.nn.Parameter(torch.zeros(6, device="cuda"))
+        return self.pose_delta
+
+    def effective_w2c(self):
+        if self.pose_delta is None:
+            return self.base_w2c
+        from utils.pose_utils import se3_exp
+        return se3_exp(self.pose_delta) @ self.base_w2c
+
+    def refresh_pose(self):
+        """Write the current (detached) effective pose into the matrices used by the rasterizer and PGSR losses."""
+        with torch.no_grad():
+            W = self.effective_w2c().detach()
+            self.world_view_transform = W.T.contiguous()
+            self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+            self.camera_center = self.world_view_transform.inverse()[3, :3]
+            self.R = W[:3, :3].T.cpu().numpy().astype(np.float64)
+            self.T = W[:3, 3].cpu().numpy().astype(np.float64)
+
+    def pose_correction(self):
+        """T = W_eff.detach()^-1 @ W_eff: identity in value, carries d/d(pose_delta).
+        Applying T to the Gaussians and rasterizing with W_eff.detach() equals rendering with W_eff."""
+        if self.pose_delta is None or not torch.is_grad_enabled():
+            return None
+        W = self.effective_w2c()
+        T = torch.inverse(W.detach()) @ W
+        return T[:3, :3], T[:3, 3]
 
     def get_image(self):
         if self.preload_img:

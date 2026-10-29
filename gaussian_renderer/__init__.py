@@ -68,6 +68,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = pc.get_scaling
         rotations = pc.get_rotation
 
+    # M5: pose refinement via an identity-valued rigid transform of the Gaussians (scheme B)
+    pose_corr = viewpoint_camera.pose_correction() if hasattr(viewpoint_camera, "pose_correction") else None
+    if pose_corr is not None:
+        from utils.pose_utils import quat_from_R_near_identity, quat_mul
+        assert cov3D_precomp is None, "pose refinement requires compute_cov3D_python=False"
+        R_T, t_T = pose_corr
+        means3D = means3D @ R_T.T + t_T
+        rotations = quat_mul(quat_from_R_near_identity(R_T)[None], rotations)
+
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
@@ -129,6 +138,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         return return_dict
 
     global_normal = pc.get_normal(viewpoint_camera)
+    if pose_corr is not None:
+        global_normal = global_normal @ pose_corr[0].T
     local_normal = global_normal @ viewpoint_camera.world_view_transform[:3,:3]
     pts_in_cam = means3D @ viewpoint_camera.world_view_transform[:3,:3] + viewpoint_camera.world_view_transform[3,:3]
     depth_z = pts_in_cam[:, 2]
