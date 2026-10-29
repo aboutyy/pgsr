@@ -111,7 +111,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Adam with lr=1, then each step is rescaled per component: (rho: pose_lr_trans, omega: pose_lr_rot)
         pose_optimizer = torch.optim.Adam(pose_params, lr=1.0, eps=1e-15)
         m5_lr_vec = torch.tensor([m5.pose_lr_trans] * 3 + [m5.pose_lr_rot] * 3, device="cuda")
-    gcp_term = GCPTerm(m5.gcp_file, train_cams) if m5.gcp_file else None
+    gcp_term = GCPTerm(m5.gcp_file, train_cams, huber_delta=m5.gcp_huber_delta, min_obs_per_cam=m5.gcp_min_obs_per_cam) if m5.gcp_file else None
     if gcp_term is not None and not m5.optimize_pose:
         print("[GCP] warning: --gcp_file without --optimize_pose has no effect on poses")
     e0 = pose_errors(train_cams); m5_log["pose_err_start"] = e0
@@ -351,8 +351,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             loss += ncc_loss
 
         if gcp_term is not None and m5.optimize_pose and iteration >= m5.pose_opt_from:
-            gcp_loss = m5.lambda_gcp * gcp_term.loss()
-            loss = loss + gcp_loss
+            gl = gcp_term.loss(viewpoint_cam if m5.gcp_only_viewpoint else None)
+            if gl is not None:
+                loss = loss + m5.lambda_gcp * gl
         loss.backward()
         iter_end.record()
         if pose_optimizer is not None:
@@ -439,6 +440,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 for c in train_cams: c.refresh_pose()
                 m5_log["pose_err_end"] = pose_errors(train_cams)
                 if gcp_term is not None: m5_log["gcp_rms_px_end"] = gcp_term.rms_px()
+                from utils.pose_utils import pose_errors_per_cam
+                pc = pose_errors_per_cam(train_cams)
+                gnames = {c.image_name for c in gcp_term.cams} if gcp_term is not None else set()
+                nobs = {}
+                if gcp_term is not None:
+                    for c, _ in gcp_term.obs: nobs[c.image_name] = nobs.get(c.image_name, 0) + 1
+                m5_log["per_cam_end"] = {k: {"rot_deg": v[0], "center": v[1], "n_gcp_obs": nobs.get(k, 0)} for k, v in pc.items()}
+                if gcp_term is not None:
+                    px = gcp_term.per_obs_px().cpu().tolist()
+                    m5_log["gcp_per_obs_px_end"] = [[c.image_name, r["point_id"], e] for (c, r), e in zip(gcp_term.obs, px)]
                 m5_log["poses_w2c"] = {c.image_name: c.effective_w2c().detach().cpu().tolist() for c in train_cams}
                 with open(os.path.join(scene.model_path, "m5_pose_log.json"), "w") as f:
                     json.dump(m5_log, f, indent=1, default=float)
@@ -540,6 +551,9 @@ if __name__ == "__main__":
     parser.add_argument("--pose_opt_from", type=int, default=500)
     parser.add_argument("--gcp_file", type=str, default="", help="group (d): GCP reprojection term (needs --optimize_pose)")
     parser.add_argument("--lambda_gcp", type=float, default=0.1)
+    parser.add_argument("--gcp_only_viewpoint", action="store_true", help="apply GCP term only to obs of the current training view (pose steps at the same rate as photometric)")
+    parser.add_argument("--gcp_min_obs_per_cam", type=int, default=1)
+    parser.add_argument("--gcp_huber_delta", type=float, default=3.0, help="<=0: plain L2")
     parser.add_argument("--pose_noise_rot_deg", type=float, default=0.0, help="smoke test: perturb train poses")
     parser.add_argument("--pose_noise_trans", type=float, default=0.0)
     parser.add_argument("--pose_noise_seed", type=int, default=0)
@@ -555,7 +569,7 @@ if __name__ == "__main__":
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     import argparse as _ap
-    m5_args = _ap.Namespace(**{k: getattr(args, k) for k in ["optimize_pose","pose_lr_rot","pose_lr_trans","pose_opt_from","gcp_file","lambda_gcp","pose_noise_rot_deg","pose_noise_trans","pose_noise_seed"]})
+    m5_args = _ap.Namespace(**{k: getattr(args, k) for k in ["optimize_pose","pose_lr_rot","pose_lr_trans","pose_opt_from","gcp_file","lambda_gcp","gcp_huber_delta","gcp_only_viewpoint","gcp_min_obs_per_cam","pose_noise_rot_deg","pose_noise_trans","pose_noise_seed"]})
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done

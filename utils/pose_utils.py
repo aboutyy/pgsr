@@ -68,6 +68,17 @@ def perturb_cameras(cams, rot_deg, trans, seed):
         cam.set_base_w2c(se3_exp(xi) @ cam.base_w2c)
 
 
+def pose_errors_per_cam(cams):
+    out = {}
+    with torch.no_grad():
+        for cam in cams:
+            W = cam.effective_w2c(); G = cam.gt_w2c
+            r = rot_err_deg(W[:3, :3].cpu().double(), G[:3, :3].cpu().double())
+            cw = -W[:3, :3].T @ W[:3, 3]; cg = -G[:3, :3].T @ G[:3, 3]
+            out[cam.image_name] = [float(r), float((cw - cg).norm())]
+    return out
+
+
 def pose_errors(cams):
     """Per-camera error of current effective pose vs. stored ground truth: (rot deg, camera-center distance)."""
     re, te = [], []
@@ -108,7 +119,7 @@ class GCPTerm:
       u,v / sigma_px in pixels of an image `image_width` px wide (rescaled to the training resolution).
     Each residual is whitened by sigma_tot^2 = sigma_px^2 + (f * sigma_xyz / z)^2, then a Huber loss is applied.
     """
-    def __init__(self, path, cams, huber_delta=3.0):
+    def __init__(self, path, cams, huber_delta=3.0, min_obs_per_cam=1):
         by_name = {c.image_name: c for c in cams}
         rows, skipped = [], 0
         with open(path) as f:
@@ -118,6 +129,11 @@ class GCPTerm:
                 if cam is None:
                     skipped += 1; continue
                 rows.append((cam, r))
+        if min_obs_per_cam > 1:
+            cnt = {}
+            for c, _ in rows: cnt[id(c)] = cnt.get(id(c), 0) + 1
+            n0 = len(rows); rows = [(c, r) for c, r in rows if cnt[id(c)] >= min_obs_per_cam]
+            print(f"[GCP] min_obs_per_cam={min_obs_per_cam}: dropped {n0 - len(rows)} observations")
         self.cams = list({id(c): c for c, _ in rows}.values())
         cidx = {id(c): i for i, c in enumerate(self.cams)}
         dev = "cuda"
@@ -153,8 +169,15 @@ class GCPTerm:
         sig = torch.sqrt(self.spx ** 2 + (self.F[self.ci, 0] * self.sx / z) ** 2)
         return (proj - self.uv) / sig[:, None]
 
-    def loss(self):
+    def loss(self, only_cam=None):
         r = self.residuals()
+        if only_cam is not None:
+            m = torch.tensor([c is only_cam for c in self.cams], device=r.device)[self.ci]
+            if not bool(m.any()):
+                return None
+            r = r[m]
+        if self.delta <= 0:  # plain L2 (same 0.5 r^2 scale as Huber's quadratic zone)
+            return 0.5 * (r * r).mean()
         return F.huber_loss(r, torch.zeros_like(r), delta=self.delta)
 
     def refresh(self):
@@ -168,6 +191,11 @@ class GCPTerm:
             for i, c in enumerate(self.cams):
                 c.world_view_transform = WT[i]; c.full_proj_transform = FP[i]; c.camera_center = Cn[i]
                 c._RT_stale = True
+
+    def per_obs_px(self):
+        with torch.no_grad():
+            proj, _ = self._proj()
+            return (proj - self.uv).norm(dim=-1)
 
     def rms_px(self):
         with torch.no_grad():
